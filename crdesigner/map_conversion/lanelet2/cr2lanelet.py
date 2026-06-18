@@ -735,6 +735,16 @@ class CR2LaneletConverter:
             lanelet_types, self._config.supported_lanelet2_subtypes
         )
 
+        if self._config.autoware:
+            # OpenDRIVE shoulder lanes arrive as LaneletType.BORDER (crdesigner maps both
+            # odr 'shoulder' and 'border' to BORDER). Emit them as subtype:road_shoulder
+            # (vm-01-15); the CARLA/RoadRunner fixtures contain no genuine 'border' lanes.
+            if not subtype_in and LaneletType.BORDER in lanelet.lanelet_type:
+                subtype, subtype_in = "road_shoulder", True
+            # A regular bicycle lane is tagged subtype:road for Autoware (vm-01-23).
+            elif subtype == "bicycle_lane":
+                subtype = "road"
+
         # append left and right way
         self.left_ways[lanelet.lanelet_id] = left_way_id
         self.right_ways[lanelet.lanelet_id] = right_way_id
