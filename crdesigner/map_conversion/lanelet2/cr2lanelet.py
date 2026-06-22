@@ -181,7 +181,12 @@ def _vertices_are_equal(
     if len(vertices1) != len(vertices2):
         return False
     diff = np.array(vertices1) - np.array(vertices2)
-    if np.abs(np.max(diff)) < ways_are_equal_tolerance:
+    # Max absolute coordinate deviation must be within tolerance. Using
+    # np.max(np.abs(diff)) (not np.abs(np.max(diff))) makes the test symmetric in
+    # its arguments — otherwise mixed-sign deltas make equality depend on call
+    # order, so a shared boundary is deduplicated for one conversion order only
+    # (e.g. RHT shared, LHT did not).
+    if np.max(np.abs(diff)) < ways_are_equal_tolerance:
         return True
     return False
 
@@ -904,6 +909,60 @@ class CR2LaneletConverter:
             self.osm.add_node(node)
         return nodes
 
+    def _shared_way_with_neighbours(self, lanelet, my_vertices, my_line_marking, my_side):
+        """Return an already-created neighbour boundary ``way`` geometrically
+        coincident with this lanelet's ``my_side`` ("left"/"right") boundary, or None.
+
+        Sharing is matched by **geometry**, not by adj_left/adj_right orientation:
+        in left-hand-traffic maps the CommonRoad left/right vertex labels are
+        inverted relative to the driving direction, so the old label-based pairing
+        compared the wrong boundaries and deduplicated nothing. Here the boundary
+        is tested against each neighbour's left and right boundary in both
+        orientations; the first coincident way is reused and tagged with the
+        combined line marking.
+        """
+        tolerance = self._config.ways_are_equal_tolerance
+        neighbour_ids = [adj for adj in (lanelet.adj_left, lanelet.adj_right) if adj is not None]
+        for adj_id in neighbour_ids:
+            adj = self.lanelet_network.find_lanelet_by_id(adj_id)
+            for adj_side in ("left", "right"):
+                way_id = (self.left_ways if adj_side == "left" else self.right_ways).get(adj_id)
+                if not way_id:
+                    continue
+                adj_vertices = adj.left_vertices if adj_side == "left" else adj.right_vertices
+                if _vertices_are_equal(my_vertices, adj_vertices, tolerance) or _vertices_are_equal(
+                    my_vertices, adj_vertices[::-1], tolerance
+                ):
+                    adj_line_marking = (
+                        adj.line_marking_left_vertices
+                        if adj_side == "left"
+                        else adj.line_marking_right_vertices
+                    )
+                    self._set_shared_way_tags(way_id, my_line_marking, adj_line_marking, my_side)
+                    return way_id
+        return None
+
+    def _set_shared_way_tags(self, way_id, my_line_marking, adj_line_marking, my_side):
+        """Tag a shared boundary ``way`` with the L2 type/subtype derived from the
+        two lanelets' line markings (combined when both are known)."""
+        type_lanelet, subtype_lanelet = _line_marking_to_type_subtype_vertices(my_line_marking)
+        type_adj, subtype_adj = _line_marking_to_type_subtype_vertices(adj_line_marking)
+        if type_lanelet != "unknown":
+            if type_adj != "unknown":
+                # combine the two halves of the shared marking; keep the existing
+                # own-then-neighbour (right) / neighbour-then-own (left) ordering so
+                # directional subtypes (solid_dashed vs dashed_solid) stay consistent.
+                subtype = (
+                    _combine_subtypes(subtype_lanelet, subtype_adj)
+                    if my_side == "right"
+                    else _combine_subtypes(subtype_adj, subtype_lanelet)
+                )
+            else:
+                subtype = subtype_lanelet
+            self.osm.ways[way_id].tag_dict = {"type": type_lanelet, "subtype": subtype}
+        elif type_adj != "unknown":
+            self.osm.ways[way_id].tag_dict = {"type": type_adj, "subtype": subtype_adj}
+
     def _get_potential_right_way(self, lanelet) -> Union[None, int]:
         """
         Check if a shared right boundary with another lanelet can be transformed
@@ -912,62 +971,9 @@ class CR2LaneletConverter:
         :param lanelet: Lanelet of which right boundary should be converted to a way.
         :return: Id of a way which can be shared, else None if it is not possible.
         """
-        if lanelet.adj_right:
-            if lanelet.adj_right_same_direction:
-                potential_right_way = self.left_ways.get(lanelet.adj_right)
-            else:
-                potential_right_way = self.right_ways.get(lanelet.adj_right)
-            if potential_right_way:
-                adj_right = self.lanelet_network.find_lanelet_by_id(lanelet.adj_right)
-                vertices = (
-                    adj_right.left_vertices
-                    if lanelet.adj_right_same_direction
-                    else adj_right.right_vertices[::-1]
-                )
-                if _vertices_are_equal(
-                    lanelet.right_vertices, vertices, self._config.ways_are_equal_tolerance
-                ):
-                    # if the shared way is found, we update its tag_dict with lanelet line markings
-
-                    # extract the relevant line marking, so we can convert it to L2 format
-                    adj_right_line_marking = (
-                        adj_right.line_marking_left_vertices
-                        if lanelet.adj_right_same_direction
-                        else adj_right.line_marking_right_vertices
-                    )
-
-                    # converting line markings to L2 format
-                    type_lanelet, subtype_lanelet = _line_marking_to_type_subtype_vertices(
-                        lanelet.line_marking_right_vertices
-                    )
-                    type_adj_right, subtype_adj_right = _line_marking_to_type_subtype_vertices(
-                        adj_right_line_marking
-                    )
-
-                    # update the tag dict accordingly
-                    if type_lanelet != "unknown":
-                        if type_adj_right != "unknown":
-                            # if there are two linemarking types, combine the subtypes to match the L2 notation
-                            # as the type should be the same, the type of the first lanelet line marking is used
-                            subtype = _combine_subtypes(subtype_lanelet, subtype_adj_right)
-                        else:
-                            subtype = subtype_lanelet
-                        self.osm.ways[potential_right_way].tag_dict = {
-                            "type": type_lanelet,
-                            "subtype": subtype,
-                        }
-                    else:
-                        if type_adj_right != "unknown":
-                            subtype = subtype_adj_right
-                            self.osm.ways[potential_right_way].tag_dict = {
-                                "type": type_adj_right,
-                                "subtype": subtype,
-                            }
-
-                    # if both lanelet types are unknown (cr default), a tag_dict is not created
-                    return potential_right_way
-
-        return None
+        return self._shared_way_with_neighbours(
+            lanelet, lanelet.right_vertices, lanelet.line_marking_right_vertices, "right"
+        )
 
     def _get_potential_left_way(self, lanelet) -> Union[None, int]:
         """
@@ -977,62 +983,9 @@ class CR2LaneletConverter:
         :param lanelet: Lanelet of which left boundary should be converted to a way.
         :return: Id of a way which can be shared, else None if it is not possible.
         """
-        if lanelet.adj_left:
-            if lanelet.adj_left_same_direction:
-                potential_left_way = self.right_ways.get(lanelet.adj_left)
-            else:
-                potential_left_way = self.left_ways.get(lanelet.adj_left)
-            if potential_left_way:
-                adj_left = self.lanelet_network.find_lanelet_by_id(lanelet.adj_left)
-                vertices = (
-                    adj_left.right_vertices
-                    if lanelet.adj_left_same_direction
-                    else adj_left.left_vertices[::-1]
-                )
-                if _vertices_are_equal(
-                    lanelet.left_vertices, vertices, self._config.ways_are_equal_tolerance
-                ):
-                    # if the shared way is found, we update its tag_dict with lanelet line markings
-
-                    # extract the relevant CR line marking, so we can convert it to L2 format
-                    adj_left_line_marking = (
-                        adj_left.line_marking_right_vertices
-                        if lanelet.adj_left_same_direction
-                        else adj_left.line_marking_left_vertices
-                    )
-
-                    # converting CR line markings to L2 format
-                    type_lanelet, subtype_lanelet = _line_marking_to_type_subtype_vertices(
-                        lanelet.line_marking_left_vertices
-                    )
-                    type_adj_left, subtype_adj_left = _line_marking_to_type_subtype_vertices(
-                        adj_left_line_marking
-                    )
-
-                    # update the tag dict accordingly
-                    if type_lanelet != "unknown":
-                        if type_adj_left != "unknown":
-                            # if there are two linemarking types, combine the subtypes to match the L2 notation
-                            # as the type should be the same, the type of the first lanelet line marking is used
-                            subtype = _combine_subtypes(subtype_adj_left, subtype_lanelet)
-                        else:
-                            subtype = subtype_lanelet
-                        self.osm.ways[potential_left_way].tag_dict = {
-                            "type": type_lanelet,
-                            "subtype": subtype,
-                        }
-                    else:
-                        if type_adj_left != "unknown":
-                            subtype = subtype_adj_left
-                            self.osm.ways[potential_left_way].tag_dict = {
-                                "type": type_adj_left,
-                                "subtype": subtype,
-                            }
-
-                    # if both lanelet types are unknown (cr default), a tag_dict is not created
-                    return potential_left_way
-
-        return None
+        return self._shared_way_with_neighbours(
+            lanelet, lanelet.left_vertices, lanelet.line_marking_left_vertices, "left"
+        )
 
     def _get_shared_first_nodes_from_other_lanelets(
         self, lanelet: Lanelet
