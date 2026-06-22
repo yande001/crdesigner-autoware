@@ -1,5 +1,6 @@
 import logging
 import warnings
+from collections import defaultdict
 from typing import Dict, List, Optional, Tuple, Union
 
 import numpy as np
@@ -274,6 +275,10 @@ class CR2LaneletConverter:
         self.last_nodes = {}  # saves last left and right node
         self.left_ways = {}
         self.right_ways = {}
+        # endpoint-bucket index of created boundary ways for the geometric
+        # sharing fallback (opposing lanes that CommonRoad did not mark adjacent).
+        # key -> [(way_id, vertices, line_marking)]
+        self._boundary_index = defaultdict(list)
         self.odr_to_l2_mapping = {}
 
         # set origin shift according to translation in scenario
@@ -705,6 +710,8 @@ class CR2LaneletConverter:
         # check if there are shared ways
         right_way_id = self._get_potential_right_way(lanelet)
         left_way_id = self._get_potential_left_way(lanelet)
+        left_created = left_way_id is None
+        right_created = right_way_id is None
 
         left_nodes, right_nodes = self._create_nodes(lanelet, left_way_id, right_way_id)
 
@@ -729,6 +736,13 @@ class CR2LaneletConverter:
                 right_way.tag_dict = {"type": lanelet2_type, "subtype": subtype}
             self.osm.add_way(right_way)
             right_way_id = right_way.id_
+
+        # index newly created boundaries so later lanelets can share them via the
+        # geometric fallback (opposing centerlines lacking CommonRoad adjacency).
+        if left_created:
+            self._index_boundary(left_way_id, lanelet.left_vertices, lanelet.line_marking_left_vertices)
+        if right_created:
+            self._index_boundary(right_way_id, lanelet.right_vertices, lanelet.line_marking_right_vertices)
 
         # create a list of lanelet type values, so we can extract the most specific one to convert it to L2 format
         lanelet_types = []
@@ -940,7 +954,39 @@ class CR2LaneletConverter:
                     )
                     self._set_shared_way_tags(way_id, my_line_marking, adj_line_marking, my_side)
                     return way_id
+
+        # Geometric fallback: CommonRoad does not always set opposite-direction
+        # adjacency (odr2cr leaves ~1/3 of coincident opposing pairs unlinked, e.g.
+        # across roads / junction connectors), so the loop above misses them and the
+        # opposing centerline would be emitted as two distinct coincident ways
+        # (vm-01-04). Search the endpoint-bucket index of already-created boundaries
+        # for one coincident with this boundary (either orientation) and reuse it.
+        # The match still requires full equality within ways_are_equal_tolerance
+        # (~1 mm), so only genuinely identical polylines merge.
+        for cand_id, cand_vertices, cand_marking in self._boundary_index.get(
+            self._endpoint_key(my_vertices), []
+        ):
+            if _vertices_are_equal(my_vertices, cand_vertices, tolerance) or _vertices_are_equal(
+                my_vertices, cand_vertices[::-1], tolerance
+            ):
+                self._set_shared_way_tags(cand_id, my_line_marking, cand_marking, my_side)
+                return cand_id
         return None
+
+    @staticmethod
+    def _endpoint_key(vertices):
+        """Bucket key from a polyline's two endpoints, rounded to a 1 m grid and
+        sorted so a polyline and its reverse land in the same bucket."""
+        first, last = vertices[0], vertices[-1]
+        p0 = (round(float(first[0])), round(float(first[1])))
+        p1 = (round(float(last[0])), round(float(last[1])))
+        return tuple(sorted((p0, p1)))
+
+    def _index_boundary(self, way_id, vertices, line_marking):
+        """Register a freshly created boundary way for the geometric fallback."""
+        self._boundary_index[self._endpoint_key(vertices)].append(
+            (way_id, vertices, line_marking)
+        )
 
     def _set_shared_way_tags(self, way_id, my_line_marking, adj_line_marking, my_side):
         """Tag a shared boundary ``way`` with the L2 type/subtype derived from the
