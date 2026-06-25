@@ -280,6 +280,11 @@ class CR2LaneletConverter:
         # key -> [(way_id, vertices, line_marking)]
         self._boundary_index = defaultdict(list)
         self.odr_to_l2_mapping = {}
+        # Autoware intersection metadata (S6): connector lanelet -> turn direction,
+        # and lanelet id -> way-relation id so the intersection_area post-pass can
+        # attach the polygon reference back onto each member lanelet.
+        self._turn_directions = self._build_turn_directions() if self._config.autoware else {}
+        self._lanelet_to_way_rel = {}
 
         # set origin shift according to translation in scenario
         if self.scenario_translation[0] != 0 and self.scenario_translation[1] != 0:
@@ -310,6 +315,8 @@ class CR2LaneletConverter:
         # append the lane_change flag to osm ways if the autoware flag is set to True
         if self._config.autoware is True:
             self._append_lane_change_tags()
+            # synthesize an intersection_area polygon per OpenDRIVE junction (vm-03-01)
+            self._add_intersection_areas()
 
         return self.osm.serialize_to_xml()
 
@@ -804,9 +811,16 @@ class CR2LaneletConverter:
             # Autoware: emit one_way:yes/no + speed_limit on drivable lanes,
             # replacing the granular one_way:<user> tags.
             self._set_autoware_lanelet_tags(lanelet, way_rel, subtype if subtype_in else None, location)
+            # Tag junction connector lanelets with their turn direction (vm-03-02).
+            turn_direction = self._turn_directions.get(lanelet.lanelet_id)
+            if turn_direction is not None:
+                way_rel.tag_dict["turn_direction"] = turn_direction
         else:
             # set the overriding tags for bidirectional users
             _set_overriding_tags_for_bidirectional_users(lanelet, way_rel)
+
+        # remember the way-relation id for the intersection_area post-pass (vm-03-01)
+        self._lanelet_to_way_rel[lanelet.lanelet_id] = way_rel.id_
 
         # add the way relation to the osm
         self.osm.add_way_relation(way_rel)
@@ -922,6 +936,98 @@ class CR2LaneletConverter:
             nodes.append(node.id_)
             self.osm.add_node(node)
         return nodes
+
+    def _build_turn_directions(self) -> Dict[int, str]:
+        """Map each junction connector lanelet id to its turn direction
+        ("left"/"straight"/"right") from the CommonRoad intersection model (vm-03-02).
+
+        odr2cr classifies each incoming's successors geometrically when it builds
+        the Intersection objects, so the OpenDRIVE <junction> turn semantics are
+        recoverable here without re-deriving them. A connector that somehow appears
+        in more than one class keeps its first assignment.
+        """
+        turn_directions = {}
+        for intersection in self.lanelet_network.intersections:
+            for incoming in intersection.incomings:
+                for direction, successors in (
+                    ("left", incoming.successors_left),
+                    ("straight", incoming.successors_straight),
+                    ("right", incoming.successors_right),
+                ):
+                    for lanelet_id in successors:
+                        turn_directions.setdefault(lanelet_id, direction)
+        return turn_directions
+
+    @staticmethod
+    def _convex_hull(points):
+        """Counter-clockwise convex hull (Andrew's monotone chain) of (x, y)
+        points; returns the unique points unchanged if fewer than three."""
+        pts = sorted({(round(float(p[0]), 6), round(float(p[1]), 6)) for p in points})
+        if len(pts) < 3:
+            return pts
+
+        def cross(o, a, b):
+            return (a[0] - o[0]) * (b[1] - o[1]) - (a[1] - o[1]) * (b[0] - o[0])
+
+        lower = []
+        for p in pts:
+            while len(lower) >= 2 and cross(lower[-2], lower[-1], p) <= 0:
+                lower.pop()
+            lower.append(p)
+        upper = []
+        for p in reversed(pts):
+            while len(upper) >= 2 and cross(upper[-2], upper[-1], p) <= 0:
+                upper.pop()
+            upper.append(p)
+        return lower[:-1] + upper[:-1]
+
+    def _add_intersection_areas(self):
+        """Synthesize an Autoware intersection_area polygon per OpenDRIVE junction
+        (vm-03-01) and reference it from every connector lanelet.
+
+        OpenDRIVE carries no explicit junction outline, so the area is approximated
+        by the convex hull of the boundary vertices of the junction's connector
+        lanelets (the successor lanelets of each incoming). The hull is emitted as a
+        closed ``area:yes`` way tagged ``type:intersection_area``, and each member
+        lanelet's relation gets an ``intersection_area`` reference tag.
+        """
+        for intersection in self.lanelet_network.intersections:
+            member_ids = set()
+            for incoming in intersection.incomings:
+                member_ids |= set(incoming.successors_left)
+                member_ids |= set(incoming.successors_straight)
+                member_ids |= set(incoming.successors_right)
+
+            points = []
+            for lanelet_id in member_ids:
+                lanelet = self.lanelet_network.find_lanelet_by_id(lanelet_id)
+                if lanelet is None:
+                    continue
+                points.extend(lanelet.left_vertices)
+                points.extend(lanelet.right_vertices)
+
+            hull = self._convex_hull(points)
+            if len(hull) < 3:
+                continue
+
+            # closed ring: repeat the first vertex as the last node
+            ring = [np.array(p) for p in hull] + [np.array(hull[0])]
+            nodes = self._create_nodes_from_vertices(ring)
+            area_way = Way(
+                self.id_count,
+                nodes,
+                tag_dict={"type": "intersection_area", "area": "yes"},
+            )
+            self.osm.add_way(area_way)
+
+            # reference the polygon from each connector lanelet
+            for lanelet_id in member_ids:
+                way_rel_id = self._lanelet_to_way_rel.get(lanelet_id)
+                if way_rel_id is None:
+                    continue
+                way_rel = self.osm.find_way_rel_by_id(way_rel_id)
+                if way_rel is not None:
+                    way_rel.tag_dict["intersection_area"] = area_way.id_
 
     def _shared_way_with_neighbours(self, lanelet, my_vertices, my_line_marking, my_side):
         """Return an already-created neighbour boundary ``way`` geometrically
