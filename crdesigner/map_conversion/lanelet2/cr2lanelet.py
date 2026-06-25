@@ -285,6 +285,9 @@ class CR2LaneletConverter:
         # attach the polygon reference back onto each member lanelet.
         self._turn_directions = self._build_turn_directions() if self._config.autoware else {}
         self._lanelet_to_way_rel = {}
+        # CommonRoad traffic-sign id -> (L2 sign way id, sign name) for robust
+        # right-of-way matching (replaces the fragile sign-position string compare).
+        self._sign_way_index = {}
 
         # set origin shift according to translation in scenario
         if self.scenario_translation[0] != 0 and self.scenario_translation[1] != 0:
@@ -306,8 +309,13 @@ class CR2LaneletConverter:
         for area in scenario.lanelet_network.areas:
             self._convert_area(area)
 
-        # map the traffic signs and the referred lanelets (yield+right_of_way) to a 'right_of_way_relation' object
-        self._add_right_of_way_relation()
+        # build right_of_way regulatory elements; Autoware gets per-intersection
+        # relations (signed yield/priority + right-before-left), the generic path
+        # keeps the simple sign-only relation.
+        if self._config.autoware:
+            self._add_intersection_right_of_way()
+        else:
+            self._add_right_of_way_relation()
 
         # map the traffic lights and the referred lanelets to a 'right_of_way_relation' object
         self._add_regulatory_element_for_traffic_lights()
@@ -483,60 +491,43 @@ class CR2LaneletConverter:
 
     def _add_right_of_way_relation(self):
         """
-        Add traffic sign relations to the lanelet2 format
+        Add a right_of_way regulatory element from stop/yield/priority signs.
+
+        The lanelet carrying each sign is found by the sign's CommonRoad id
+        (``self._sign_way_index``, populated in ``_convert_traffic_sign``) rather
+        than by string-comparing transformed coordinates, which never matched in
+        practice (float formatting + an ``ele`` "0" vs "0.0" mismatch) so the
+        relation came out empty even on maps with stop/yield signs (vm-03-10).
         """
         refers = []
         yield_ways = []
         right_of_ways = []
         ref_line = []
         # convert stop lines of yield lanelets to ways and add them to L2 map
-        # create a dictionary to map the stop lines with newly created ways for easier mapping
         dict_stop_lines = self._create_stop_line_to_way_dictionary()
 
-        # go through signs
-        for way in self.osm.ways:
-            if self.osm.find_way_by_id(way).tag_dict.get("type") == "traffic_sign":
-                # find the corresponding yield and right of way ways
-                # find x and y coordinates of the sign and match it to signs of the lanelets to find the lanelet
-                # consider z-coordinate as well
+        for ll in self.lanelet_network.lanelets:
+            if not ll.traffic_signs:
+                continue
+            way_rel_id = self._lanelet_to_way_rel.get(ll.lanelet_id)
+            if way_rel_id is None:
+                continue
+            for traffic_sign_id in ll.traffic_signs:
+                entry = self._sign_way_index.get(traffic_sign_id)
+                if entry is None:
+                    continue
+                sign_way_id, sign_name = entry
+                if sign_name == "MAX_SPEED":
+                    continue  # speed limits are handled as their own reg-elem
+                refers.append(sign_way_id)
+                if sign_name in ("YIELD", "STOP"):
+                    yield_ways.append(way_rel_id)
+                    stop_line_way = dict_stop_lines.get(ll.lanelet_id)
+                    if stop_line_way is not None:
+                        ref_line.append(stop_line_way)
+                elif sign_name in ("RIGHT_OF_WAY", "PRIORITY"):
+                    right_of_ways.append(way_rel_id)
 
-                # in lanelet2cr, only node 0 is taken for the position
-                n_lon = self.osm.find_node_by_id(self.osm.find_way_by_id(way).nodes[0]).lon
-                n_lat = self.osm.find_node_by_id(self.osm.find_way_by_id(way).nodes[0]).lat
-                n_ele = self.osm.find_node_by_id(self.osm.find_way_by_id(way).nodes[0]).ele
-
-                # go through the lanelets to find the lanelet that has the matching traffic_sign in its attribute
-                for ll in self.lanelet_network.lanelets:
-                    for traffic_sign_id in ll.traffic_signs:
-                        # if 'position' returns 2 values, *z will be empty. Else, it will be an array with remaining
-                        # values
-                        x, y, *z = self.lanelet_network.find_traffic_sign_by_id(
-                            traffic_sign_id
-                        ).position
-                        if len(z) == 0:
-                            z = 0
-                        else:
-                            z = z[0]
-                        lat_sign, lon_sign = self.transformer.transform(
-                            self.origin_utm[0] + x, self.origin_utm[1] + y
-                        )
-                        # have to map the signs based on the position,
-                        # as the same 2 signs do not have the same ID in L2 and CR format
-                        if n_lon == str(lon_sign) and n_lat == str(lat_sign) and n_ele == str(z):
-                            # position matches, found the corresponding lanelet with selected sign
-                            # extract the way that corresponds to our lanelet
-                            # sign -> lanelet -> way (right+left) -> way relation
-                            right_way_id = self.right_ways[ll.lanelet_id]
-                            left_way_id = self.left_ways[ll.lanelet_id]
-                            for way_rel in self.osm.way_relations:
-                                if (
-                                    self.osm.find_way_rel_by_id(way_rel).right_way == right_way_id
-                                    and self.osm.find_way_rel_by_id(way_rel).left_way == left_way_id
-                                ):
-                                    # found the corresponding way_rel, append to the lanelet
-                                    refers, yield_ways, right_of_ways, ref_line = (
-                                        self._append_from_sign(ll, way, way_rel, dict_stop_lines)
-                                    )
         # do not add right_of_way_rel if there are no signs
         if len(refers) > 0:
             self.osm.add_regulatory_element(
@@ -549,6 +540,115 @@ class CR2LaneletConverter:
                     tag_dict={"subtype": "right_of_way", "type": "regulatory_element"},
                 )
             )
+
+    def _add_intersection_right_of_way(self):
+        """Build right_of_way regulatory elements for junctions (vm-03-10/11).
+
+        OpenDRIVE ``<junction><priority>`` is not parsed by odr2cr, so priority is
+        inferred from the CommonRoad model via two complementary mechanisms:
+
+        * **(A) Sign-controlled** (vm-03-10) — every lanelet carrying a STOP/YIELD
+          sign yields. One relation per signed lanelet: the sign as ``refers``, the
+          lanelet as ``yield``, its stop line as ``ref_line``. Priority is the cross
+          traffic of the junction the lanelet feeds *when* the intersection model
+          links it (in the CARLA fixtures odr2cr leaves the signs unlinked, so the
+          priority side is usually empty — the stop obligation is still recorded).
+        * **(B) Unsignalised right-before-left** (vm-03-11) — from ``left_of``:
+          ``X.left_of == Y`` means Y sits to X's left, i.e. X is to Y's right, so
+          **Y yields to X**. One relation per yielding incoming, pairing its
+          connectors (yield) with the priority incoming's connectors. Approaches
+          already governed by a stop/yield sign are skipped (the sign wins).
+
+        Yield/priority members are connector (successor) lanelets, which already
+        carry ``turn_direction`` / ``intersection_area``.
+        """
+        dict_stop_lines = self._create_stop_line_to_way_dictionary()
+
+        def connector_rels_from_ids(ids):
+            return [self._lanelet_to_way_rel[i] for i in ids if i in self._lanelet_to_way_rel]
+
+        def connector_ids(incoming):
+            return (
+                set(incoming.successors_left)
+                | set(incoming.successors_straight)
+                | set(incoming.successors_right)
+            )
+
+        def emit(refers, yield_ways, right_of_ways, ref_line):
+            if not yield_ways:
+                return
+            self.osm.add_regulatory_element(
+                RegulatoryElement(
+                    self.id_count,
+                    refers,
+                    yield_ways,
+                    right_of_ways,
+                    ref_line=ref_line,
+                    tag_dict={"subtype": "right_of_way", "type": "regulatory_element"},
+                )
+            )
+
+        # connector lanelet id -> (intersection, owning incoming id), for priority lookup
+        connector_owner = {}
+        for intersection in self.lanelet_network.intersections:
+            for inc in intersection.incomings:
+                for cid in connector_ids(inc):
+                    connector_owner[cid] = (intersection, inc.incoming_id)
+
+        # (A) sign-controlled approaches
+        signed_lanelets = set()
+        for ll in self.lanelet_network.lanelets:
+            if not ll.traffic_signs:
+                continue
+            sign_ways = []
+            for sid in ll.traffic_signs:
+                entry = self._sign_way_index.get(sid)
+                if entry is not None and entry[1] in ("YIELD", "STOP"):
+                    sign_ways.append(entry[0])
+            if not sign_ways:
+                continue
+            way_rel_id = self._lanelet_to_way_rel.get(ll.lanelet_id)
+            if way_rel_id is None:
+                continue
+            signed_lanelets.add(ll.lanelet_id)
+            # priority = the other incomings' connectors at the junction this feeds
+            right_of_ways = []
+            for succ in ll.successor:
+                owner = connector_owner.get(succ)
+                if owner is None:
+                    continue
+                intersection, my_inc = owner
+                for inc in intersection.incomings:
+                    if inc.incoming_id != my_inc:
+                        right_of_ways += connector_rels_from_ids(connector_ids(inc))
+            stop_way = dict_stop_lines.get(ll.lanelet_id)
+            emit(sign_ways, [way_rel_id], right_of_ways, [stop_way] if stop_way else [])
+
+        # (B) unsignalised right-before-left
+        for intersection in self.lanelet_network.intersections:
+            info = {}
+            for inc in intersection.incomings:
+                info[inc.incoming_id] = {
+                    "connectors": connector_rels_from_ids(connector_ids(inc)),
+                    "signed": any(l in signed_lanelets for l in inc.incoming_lanelets),
+                    "stops": [
+                        dict_stop_lines[l] for l in inc.incoming_lanelets if l in dict_stop_lines
+                    ],
+                }
+            priorities = defaultdict(list)  # yielding incoming id -> [priority incoming ids]
+            for inc in intersection.incomings:
+                yielding = inc.left_of
+                if yielding is None or yielding not in info:
+                    continue
+                if info[yielding]["signed"]:
+                    continue  # a stop/yield sign already governs this approach
+                priorities[yielding].append(inc.incoming_id)
+            for yielding_id, prio_ids in priorities.items():
+                right_of_ways = []
+                for pid in prio_ids:
+                    right_of_ways += info[pid]["connectors"]
+                emit([], info[yielding_id]["connectors"], right_of_ways,
+                     info[yielding_id]["stops"])
 
     def _create_stop_line_to_way_dictionary(self) -> Dict[int, str]:
         """
@@ -597,51 +697,6 @@ class CR2LaneletConverter:
                 # map the way with the lanelet
                 dict_stop_lines[ll.lanelet_id] = stop_line_way.id_
         return dict_stop_lines
-
-    def _append_from_sign(
-        self, ll: Lanelet, way: Way, way_rel: WayRelation, dict_stop_lines: Dict[int, str]
-    ) -> Tuple[List[Way], List[WayRelation], List[WayRelation], List[str]]:
-        """
-        Extracts relevant information from the way that represents a traffic sign, such sa subtype and name,
-        and appends the information to one (or none) of the possible arrays
-
-        :param ll: lanelet from which we use its id to match it with the corresponding stop line in the dict_stop_lines
-        :param way: way that corresponds to the traffic sign being converted
-        :param way_rel: way relation that corresponds to the right and left way of the lanelet.
-        :param dict_stop_lines: dictionary that maps the id of the lanelet(CR) with its corresponding stop_line way(L2).
-        :return: tuple of lists that correspond to the attributes of the regulatory element constructor
-        """
-        refers = []
-        yield_ways = []
-        right_of_ways = []
-        ref_line = []
-        # subtype from the L2 format, i.e. "de205" -> CR format, i.e. "205"
-        subtype = self.osm.find_way_by_id(way).tag_dict.get("subtype")[2:]
-        # iterate through sign IDs to find the corresponding sign with that subtype
-        sign_name = ""
-        sign_found = False
-        for country in self._config.supported_countries:
-            if sign_found is True:
-                break
-            for country_sign in country:
-                if subtype == str(country_sign.value):
-                    sign_name = country_sign.name
-                    sign_found = True
-        # no need to add the speed limit sign to the way of rel
-        if sign_name != "MAX_SPEED":
-            refers.append(way)
-        # for now only check the german types,
-        # as it follows the conversion in add_sign function
-        if sign_name in ("YIELD", "STOP"):
-            yield_ways.append(way_rel)
-            # what if it does not have a stop line? Or it must have it?
-            logging.info("cr2lanelet::_append_from_sign: lanelet with yield sign has no")
-            if stop_line_way := dict_stop_lines.get(ll.lanelet_id) is not None:
-                ref_line.append(stop_line_way)
-        elif sign_name in ("RIGHT_OF_WAY", "PRIORITY"):
-            right_of_ways.append(way_rel)
-
-        return refers, yield_ways, right_of_ways, ref_line
 
     def _convert_traffic_sign(self, sign: TrafficSign):
         """
@@ -706,6 +761,10 @@ class CR2LaneletConverter:
                 },
             )
         )
+
+        # index the sign by its CommonRoad id so right-of-way relations can be
+        # built by id lookup (vm-03-10) instead of fragile position matching.
+        self._sign_way_index[sign.traffic_sign_id] = (traffic_sign_wayid, sign_id.name)
 
     def _convert_lanelet(self, lanelet: Lanelet):
         """
