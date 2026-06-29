@@ -1111,14 +1111,65 @@ class CR2LaneletConverter:
             upper.append(p)
         return lower[:-1] + upper[:-1]
 
+    def _intersection_area_ring(self, member_ids):
+        """Closed (x, y) ring delineating a junction's range (vm-03-08).
+
+        OpenDRIVE carries no junction outline, so the range is the dissolved
+        **union of the connector footprints** (each connector's left boundary +
+        reversed right boundary). That union is bounded by the outer connector
+        edges and is typically concave — a tighter range than the convex hull
+        (~0.8x its area on TownBig). When a junction's connectors are spatially
+        disjoint (separate turn corridors with an uncovered centre) the union is a
+        MultiPolygon; there the convex hull is the right single-polygon
+        delineation of the crossing conflict zone. Falls back to the convex hull
+        on any geometry error so an area is always produced.
+        """
+        footprints, points = [], []
+        for lanelet_id in member_ids:
+            lanelet = self.lanelet_network.find_lanelet_by_id(lanelet_id)
+            if lanelet is None:
+                continue
+            left = [(float(v[0]), float(v[1])) for v in lanelet.left_vertices]
+            right = [(float(v[0]), float(v[1])) for v in lanelet.right_vertices]
+            points.extend(left)
+            points.extend(right)
+            ring = left + right[::-1]
+            if len(ring) >= 3:
+                footprints.append(ring)
+
+        try:
+            from shapely.geometry import MultiPolygon, Polygon
+            from shapely.ops import unary_union
+
+            polys = []
+            for ring in footprints:
+                poly = Polygon(ring)
+                if not poly.is_valid:
+                    poly = poly.buffer(0)
+                if not poly.is_empty and poly.area > 0:
+                    polys.append(poly)
+            if polys:
+                union = unary_union(polys)
+                geom = union.convex_hull if isinstance(union, MultiPolygon) else union
+                geom = geom.simplify(0.3, preserve_topology=True)
+                coords = list(geom.exterior.coords)
+                if len(coords) >= 4:
+                    return coords
+        except Exception:
+            pass
+
+        hull = self._convex_hull(points)
+        if len(hull) >= 3:
+            return list(hull) + [hull[0]]
+        return None
+
     def _add_intersection_areas(self):
         """Synthesize an Autoware intersection_area polygon per OpenDRIVE junction
-        (vm-03-01) and reference it from every connector lanelet.
+        (vm-03-01/08) and reference it from every connector lanelet.
 
-        OpenDRIVE carries no explicit junction outline, so the area is approximated
-        by the convex hull of the boundary vertices of the junction's connector
-        lanelets (the successor lanelets of each incoming). The hull is emitted as a
-        closed ``area:yes`` way tagged ``type:intersection_area``, and each member
+        The polygon (``_intersection_area_ring``) delineates the junction range by
+        the union of its connector footprints. It is emitted as a closed
+        ``area:yes`` way tagged ``type:intersection_area``, and each member
         lanelet's relation gets an ``intersection_area`` reference tag.
         """
         for intersection in self.lanelet_network.intersections:
@@ -1128,21 +1179,10 @@ class CR2LaneletConverter:
                 member_ids |= set(incoming.successors_straight)
                 member_ids |= set(incoming.successors_right)
 
-            points = []
-            for lanelet_id in member_ids:
-                lanelet = self.lanelet_network.find_lanelet_by_id(lanelet_id)
-                if lanelet is None:
-                    continue
-                points.extend(lanelet.left_vertices)
-                points.extend(lanelet.right_vertices)
-
-            hull = self._convex_hull(points)
-            if len(hull) < 3:
+            ring = self._intersection_area_ring(member_ids)
+            if ring is None:
                 continue
-
-            # closed ring: repeat the first vertex as the last node
-            ring = [np.array(p) for p in hull] + [np.array(hull[0])]
-            nodes = self._create_nodes_from_vertices(ring)
+            nodes = self._create_nodes_from_vertices([np.array(p) for p in ring])
             area_way = Way(
                 self.id_count,
                 nodes,
