@@ -167,6 +167,33 @@ def _extract_and_convert_subtype_name(
         return "road", True
 
 
+def _traffic_light_bulb_colors(light) -> List[str]:
+    """Bulb colors (top→bottom) for a traffic light's light_bulbs linestring.
+
+    CARLA-derived signals leave ``light.color`` empty, so the lamps are inferred
+    from the cycle states: red/yellow/green present in any state (``redYellow``
+    contributes both red and yellow). Falls back to ``light.color`` then to the
+    standard three-bulb layout so a light_bulbs linestring is always produced.
+    """
+    states = set()
+    cycle = getattr(light, "traffic_light_cycle", None)
+    if cycle is not None:
+        for element in getattr(cycle, "cycle_elements", []) or []:
+            states.add(element.state.value)
+    colors = []
+    if "red" in states or "redYellow" in states:
+        colors.append("red")
+    if "yellow" in states or "redYellow" in states:
+        colors.append("yellow")
+    if "green" in states:
+        colors.append("green")
+    if not colors and light.color:
+        colors = [c.value for c in light.color]
+    if not colors:
+        colors = ["red", "yellow", "green"]
+    return colors
+
+
 def _vertices_are_equal(
     vertices1: List[np.ndarray], vertices2: List[np.ndarray], ways_are_equal_tolerance: float
 ) -> bool:
@@ -288,6 +315,8 @@ class CR2LaneletConverter:
         # CommonRoad traffic-sign id -> (L2 sign way id, sign name) for robust
         # right-of-way matching (replaces the fragile sign-position string compare).
         self._sign_way_index = {}
+        # traffic_light way id -> light_bulbs way id (Autoware lamp linestring, vm-04-03)
+        self._light_bulbs_by_tl = {}
 
         # set origin shift according to translation in scenario
         if self.scenario_translation[0] != 0 and self.scenario_translation[1] != 0:
@@ -367,12 +396,19 @@ class CR2LaneletConverter:
                 way_tl = Way(self.id_count, [x, y])
                 self.osm.add_way(way_tl)
                 way_list = [way_tl.id_]
+                # link each referenced traffic_light to its light_bulbs lamps (vm-04-03)
+                light_bulbs_list = [
+                    self._light_bulbs_by_tl[w]
+                    for w in traffic_light_reference_list
+                    if w in self._light_bulbs_by_tl
+                ]
                 regulatory_element_id = self.id_count
                 self.osm.add_regulatory_element(
                     RegulatoryElement(
                         regulatory_element_id,
                         traffic_light_reference_list,
                         ref_line=way_list,
+                        light_bulbs=light_bulbs_list,
                         tag_dict={"subtype": "traffic_light", "type": "regulatory_element"},
                     )
                 )
@@ -461,12 +497,10 @@ class CR2LaneletConverter:
                 Node(id3, lat3, lon3, z, autoware=autoware, local_x=localx3, local_y=localy3)
             )
 
-        # get the first light color as subtype
-        traffic_light_subtype = ""
-        for col in light.color:
-            traffic_light_subtype += f"{col.value}_"
-        traffic_light_subtype = traffic_light_subtype[:-1]
-        # traffic_light_subtype = light.traffic_light_cycle.cycle_elements[0].state.value
+        # bulb colors: light.color is empty for CARLA-derived signals, so derive
+        # them from the cycle states (vm-04-03).
+        bulb_colors = _traffic_light_bulb_colors(light)
+        traffic_light_subtype = "_".join(c.value for c in light.color) or "_".join(bulb_colors)
         # Autoware supports that traffic lights only consist of 2 nodes instead of 3
         if autoware:
             self.osm.add_way(
@@ -480,6 +514,8 @@ class CR2LaneletConverter:
                     },
                 )
             )
+            # light_bulbs lamp linestring linked to this traffic_light (vm-04-03)
+            self._emit_light_bulbs(light, traffic_light_id, z, bulb_colors)
         else:
             self.osm.add_way(
                 Way(
@@ -488,6 +524,39 @@ class CR2LaneletConverter:
                     tag_dict={"subtype": traffic_light_subtype, "type": "traffic_light"},
                 )
             )
+
+    def _emit_light_bulbs(self, light, traffic_light_id, z, bulb_colors):
+        """Emit an Autoware ``light_bulbs`` lamp linestring for a traffic light
+        (vm-04-03) and record it against the traffic_light way.
+
+        OpenDRIVE/CommonRoad carries no individual lamp geometry, so the bulbs are
+        synthesised at the light's position, stacked vertically (red top → green
+        bottom, ~0.35 m apart), each node tagged with its ``color``. The way is
+        tagged ``traffic_light_id`` so Autoware can pair lamps with their light.
+        """
+        lat, lon = self.transformer.transform(
+            self.origin_utm[0] + light.position[0], self.origin_utm[1] + light.position[1]
+        )
+        local_x = local_y = None
+        if self._config.use_local_coordinates:
+            local_x, local_y = light.position[0], light.position[1]
+        bulb_nodes = []
+        for i, color in enumerate(bulb_colors):
+            nid = self.id_count
+            self.osm.add_node(
+                Node(nid, lat, lon, z - i * 0.35, autoware=True,
+                     local_x=local_x, local_y=local_y, extra_tags={"color": color})
+            )
+            bulb_nodes.append(nid)
+        if not bulb_nodes:
+            return
+        bulbs_way = Way(
+            self.id_count,
+            bulb_nodes,
+            tag_dict={"type": "light_bulbs", "traffic_light_id": str(traffic_light_id)},
+        )
+        self.osm.add_way(bulbs_way)
+        self._light_bulbs_by_tl[str(traffic_light_id)] = bulbs_way.id_
 
     def _add_right_of_way_relation(self):
         """
@@ -1327,8 +1396,13 @@ class CR2LaneletConverter:
         """
         # Default applied where the marking does not determine lane_change; user-configurable.
         default_lane_change = getattr(self._config, "autoware_default_lane_change", "no")
+        # Point/area features are not lane boundaries — lane_change is meaningless on them.
+        non_boundary = {"traffic_light", "traffic_sign", "light_bulbs", "stop_line",
+                        "intersection_area"}
         ways = list(self.osm.ways.values())
         for way in ways:
+            if way.tag_dict.get("type") in non_boundary:
+                continue
             if way.tag_dict:
                 if "subtype" in way.tag_dict:
                     subtype = way.tag_dict["subtype"]

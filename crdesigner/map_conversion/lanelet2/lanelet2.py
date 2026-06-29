@@ -19,6 +19,7 @@ class Node:
         autoware: bool = False,
         local_x: Optional[float] = None,
         local_y: Optional[float] = None,
+        extra_tags: Optional[Dict[str, str]] = None,
     ):
         """
         Initialization of Node
@@ -29,6 +30,7 @@ class Node:
         :param autoware: Boolean indicating whether the map is autoware-compatible.
         :param local_x: local x-position instead of latitude/longitude (lon/lat values have no meaning)
         :param local_y: local y-position instead of latitude/longitude (lon/lat values have no meaning)
+        :param extra_tags: extra OSM tags for this node (e.g. a traffic-light bulb's color)
         """
         self.id_: str = str(id_)
         self.lat: str = str(lat)
@@ -37,6 +39,7 @@ class Node:
         self.autoware: bool = autoware
         self.local_x: Optional[float] = local_x
         self.local_y: Optional[float] = local_y
+        self.extra_tags: Dict[str, str] = extra_tags if extra_tags is not None else {}
         self.mgrs_code: Optional[str] = None
 
         if self.autoware:
@@ -72,6 +75,10 @@ class Node:
             mgrs_code.set("k", "mgrs_code")
             mgrs_code.set("v", self.mgrs_code)
             node.append(mgrs_code)
+        for k, v in self.extra_tags.items():
+            tag = etree.SubElement(node, "tag")
+            tag.set("k", k)
+            tag.set("v", str(v))
 
         return node
 
@@ -224,6 +231,7 @@ class RegulatoryElement:
         right_of_ways: Optional[list] = None,
         tag_dict: Optional[Dict[str, str]] = None,
         ref_line: Optional[list] = None,
+        light_bulbs: Optional[list] = None,
     ):
         """
         Initialization of RegulatoryElement
@@ -234,12 +242,14 @@ class RegulatoryElement:
         :param right_of_ways: list of the right of way IDs that the relation contains
         :param tag_dict: tag dictionary of the RegulatoryElement
         :param ref_line: list of the ref line IDs of the RegulatoryElement
+        :param light_bulbs: list of light_bulbs way IDs (Autoware traffic-light lamps)
         """
         self.id_ = str(id_)
         self.refers = [str(i) for i in refers] if refers is not None else ()
         self.yield_ways = [str(i) for i in yield_ways] if yield_ways is not None else ()
         self.right_of_ways = [str(i) for i in right_of_ways] if right_of_ways is not None else ()
         self.ref_line = [str(i) for i in ref_line] if ref_line is not None else []
+        self.light_bulbs = [str(i) for i in light_bulbs] if light_bulbs is not None else []
         self.tag_dict = tag_dict if tag_dict is not None else {}
 
     def serialize_to_xml(self) -> etree.Element:
@@ -271,6 +281,11 @@ class RegulatoryElement:
             right_way.set("type", "way")
             right_way.set("ref", r)
             right_way.set("role", "ref_line")
+        for lb in self.light_bulbs:
+            member = etree.SubElement(rel, "member")
+            member.set("type", "way")
+            member.set("ref", lb)
+            member.set("role", "light_bulbs")
         for tag_key, tag_value in self.tag_dict.items():
             xml_node = etree.SubElement(rel, "tag")
             xml_node.set("k", tag_key)
