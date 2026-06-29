@@ -219,6 +219,50 @@ def _vertices_are_equal(
     return False
 
 
+def _resample_polyline(vertices, n):
+    """Return ``n`` points at equal arc-length fractions along a polyline."""
+    pts = [np.asarray(v, dtype=float) for v in vertices]
+    seg = [float(np.linalg.norm(pts[i + 1] - pts[i])) for i in range(len(pts) - 1)]
+    total = sum(seg)
+    if total == 0:
+        return [pts[0]] * n
+    out = []
+    for k in range(n):
+        target = total * k / (n - 1)
+        acc = 0.0
+        for i, s in enumerate(seg):
+            if acc + s >= target or i == len(seg) - 1:
+                t = (target - acc) / s if s > 0 else 0.0
+                out.append(pts[i] + t * (pts[i + 1] - pts[i]))
+                break
+            acc += s
+    return out
+
+
+def _polylines_coincident(vertices1, vertices2, tol, n=8):
+    """True if two polylines trace the same physical line within ``tol``, sampled
+    at ``n`` arc-length stations and checked in both orientations.
+
+    Unlike ``_vertices_are_equal`` this does **not** require matching vertex
+    counts, so it catches coincident boundaries that odr2cr sampled at different
+    densities (e.g. adjacent junction-connector dividers, vm-03-07). ``tol`` is
+    kept well below a lane width so only genuinely coincident lines merge.
+    """
+    if len(vertices1) < 2 or len(vertices2) < 2:
+        return False
+    r1 = _resample_polyline(vertices1, n)
+    r2 = _resample_polyline(vertices2, n)
+    fwd = max(float(np.linalg.norm(r1[i] - r2[i])) for i in range(n))
+    rev = max(float(np.linalg.norm(r1[i] - r2[n - 1 - i])) for i in range(n))
+    return min(fwd, rev) < tol
+
+
+# Coincidence tolerance for the resample-based boundary merge. Genuinely separate
+# adjacent lanes are >=0.2 m apart, so 0.12 m stays clear of over-merge while
+# still catching the coincident-but-mismatched-vertex-count residual (vm-03-07).
+COINCIDENT_RESAMPLE_TOL = 0.12
+
+
 class CR2LaneletConverter:
     """
     Class to convert CommonRoad lanelet to the OSM representation.
@@ -1314,13 +1358,19 @@ class CR2LaneletConverter:
         # opposing centerline would be emitted as two distinct coincident ways
         # (vm-01-04). Search the endpoint-bucket index of already-created boundaries
         # for one coincident with this boundary (either orientation) and reuse it.
-        # The match still requires full equality within ways_are_equal_tolerance
-        # (~1 mm), so only genuinely identical polylines merge.
+        # Equal-vertex-count coincidence (~1 mm) is matched first; failing that, a
+        # resample-based test (COINCIDENT_RESAMPLE_TOL) catches coincident
+        # boundaries that odr2cr sampled at different vertex counts — the residual
+        # behind vm-03-07 (adjacent connector dividers) and vm-01-04/16. The 0.12 m
+        # tolerance stays well below a lane width, so only genuinely coincident
+        # lines merge.
         for cand_id, cand_vertices, cand_marking in self._boundary_index.get(
             self._endpoint_key(my_vertices), []
         ):
-            if _vertices_are_equal(my_vertices, cand_vertices, tolerance) or _vertices_are_equal(
-                my_vertices, cand_vertices[::-1], tolerance
+            if (
+                _vertices_are_equal(my_vertices, cand_vertices, tolerance)
+                or _vertices_are_equal(my_vertices, cand_vertices[::-1], tolerance)
+                or _polylines_coincident(my_vertices, cand_vertices, COINCIDENT_RESAMPLE_TOL)
             ):
                 self._set_shared_way_tags(cand_id, my_line_marking, cand_marking, my_side)
                 return cand_id
