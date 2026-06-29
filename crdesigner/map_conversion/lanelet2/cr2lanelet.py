@@ -354,6 +354,8 @@ class CR2LaneletConverter:
             self._append_lane_change_tags()
             # synthesize an intersection_area polygon per OpenDRIVE junction (vm-03-01)
             self._add_intersection_areas()
+            # crosswalk_polygon + crosswalk regulatory element per crosswalk (vm-05-01)
+            self._add_crosswalks()
 
         return self.osm.serialize_to_xml()
 
@@ -1156,6 +1158,83 @@ class CR2LaneletConverter:
                 way_rel = self.osm.find_way_rel_by_id(way_rel_id)
                 if way_rel is not None:
                     way_rel.tag_dict["intersection_area"] = area_way.id_
+
+    @staticmethod
+    def _is_crosswalk(lanelet) -> bool:
+        """True if a CommonRoad lanelet is a pedestrian crossing."""
+        return LaneletType.CROSSWALK in lanelet.lanelet_type
+
+    def _lanelets_crossed_by(self, crosswalk) -> List[int]:
+        """Vehicle lanelet ids that a crosswalk lanelet passes over.
+
+        Found by sampling the crosswalk centerline against the lanelet network;
+        pedestrian lanelets (other crosswalks, sidewalks/walkways) are excluded
+        so the crosswalk regulatory element only binds the crossing road lanelets.
+        """
+        sample = [np.array(v) for v in crosswalk.center_vertices]
+        if not sample:
+            return []
+        found = set()
+        for ids in self.lanelet_network.find_lanelet_by_position(sample):
+            found.update(ids)
+        crossed = []
+        pedestrian = {LaneletType.CROSSWALK, LaneletType.SIDEWALK}
+        for lid in found:
+            other = self.lanelet_network.find_lanelet_by_id(lid)
+            if other is None or pedestrian & other.lanelet_type:
+                continue
+            crossed.append(lid)
+        return crossed
+
+    def _add_crosswalks(self):
+        """Emit the Autoware crosswalk profile (vm-05-01) for every crosswalk lanelet.
+
+        A CommonRoad crosswalk lanelet already converts to a ``subtype:crosswalk``
+        way-relation, but Autoware additionally needs (a) a ``crosswalk_polygon``
+        area describing the painted crossing and (b) a ``subtype:crosswalk``
+        regulatory element that links the crossing vehicle lanelets to the
+        crosswalk. The polygon is the crosswalk lanelet's own footprint (left
+        boundary then right boundary reversed, closed); the crossed vehicle
+        lanelets are recovered geometrically from the crosswalk centerline.
+        """
+        for lanelet in self.lanelet_network.lanelets:
+            if not self._is_crosswalk(lanelet):
+                continue
+            cw_rel_id = self._lanelet_to_way_rel.get(lanelet.lanelet_id)
+            if cw_rel_id is None:
+                continue
+
+            # crosswalk_polygon footprint: left boundary, right boundary reversed,
+            # then closed back to the first vertex.
+            ring = list(lanelet.left_vertices) + list(lanelet.right_vertices[::-1])
+            ring.append(ring[0])
+            nodes = self._create_nodes_from_vertices([np.array(p) for p in ring])
+            polygon_way = Way(
+                self.id_count,
+                nodes,
+                tag_dict={"type": "crosswalk_polygon", "area": "yes"},
+            )
+            self.osm.add_way(polygon_way)
+
+            reg_id = self.id_count
+            self.osm.add_regulatory_element(
+                RegulatoryElement(
+                    reg_id,
+                    refers_lanelets=[cw_rel_id],
+                    crosswalk_polygon=[polygon_way.id_],
+                    tag_dict={"type": "regulatory_element", "subtype": "crosswalk"},
+                )
+            )
+
+            # bind the crosswalk reg-elem to every vehicle lanelet it crosses
+            for road_id in self._lanelets_crossed_by(lanelet):
+                way_rel_id = self._lanelet_to_way_rel.get(road_id)
+                if way_rel_id is None:
+                    continue
+                way_rel = self.osm.find_way_rel_by_id(way_rel_id)
+                if way_rel is None or reg_id in way_rel.regulatory_elements:
+                    continue
+                way_rel.regulatory_elements.append(reg_id)
 
     def _shared_way_with_neighbours(self, lanelet, my_vertices, my_line_marking, my_side):
         """Return an already-created neighbour boundary ``way`` geometrically

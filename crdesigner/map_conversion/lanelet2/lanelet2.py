@@ -232,6 +232,8 @@ class RegulatoryElement:
         tag_dict: Optional[Dict[str, str]] = None,
         ref_line: Optional[list] = None,
         light_bulbs: Optional[list] = None,
+        refers_lanelets: Optional[list] = None,
+        crosswalk_polygon: Optional[list] = None,
     ):
         """
         Initialization of RegulatoryElement
@@ -243,6 +245,10 @@ class RegulatoryElement:
         :param tag_dict: tag dictionary of the RegulatoryElement
         :param ref_line: list of the ref line IDs of the RegulatoryElement
         :param light_bulbs: list of light_bulbs way IDs (Autoware traffic-light lamps)
+        :param refers_lanelets: list of lanelet (relation) IDs referred to with the
+            ``refers`` role — e.g. the crosswalk lanelet of a crosswalk reg-elem
+        :param crosswalk_polygon: list of crosswalk_polygon way IDs (Autoware
+            crosswalk detection area)
         """
         self.id_ = str(id_)
         self.refers = [str(i) for i in refers] if refers is not None else ()
@@ -250,6 +256,8 @@ class RegulatoryElement:
         self.right_of_ways = [str(i) for i in right_of_ways] if right_of_ways is not None else ()
         self.ref_line = [str(i) for i in ref_line] if ref_line is not None else []
         self.light_bulbs = [str(i) for i in light_bulbs] if light_bulbs is not None else []
+        self.refers_lanelets = [str(i) for i in refers_lanelets] if refers_lanelets is not None else []
+        self.crosswalk_polygon = [str(i) for i in crosswalk_polygon] if crosswalk_polygon is not None else []
         self.tag_dict = tag_dict if tag_dict is not None else {}
 
     def serialize_to_xml(self) -> etree.Element:
@@ -286,6 +294,16 @@ class RegulatoryElement:
             member.set("type", "way")
             member.set("ref", lb)
             member.set("role", "light_bulbs")
+        for ll in self.refers_lanelets:
+            member = etree.SubElement(rel, "member")
+            member.set("type", "relation")
+            member.set("ref", ll)
+            member.set("role", "refers")
+        for poly in self.crosswalk_polygon:
+            member = etree.SubElement(rel, "member")
+            member.set("type", "way")
+            member.set("ref", poly)
+            member.set("role", "crosswalk_polygon")
         for tag_key, tag_value in self.tag_dict.items():
             xml_node = etree.SubElement(rel, "tag")
             xml_node.set("k", tag_key)
