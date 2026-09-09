@@ -439,7 +439,11 @@ class CR2LaneletConverter:
                 x, y = self._get_shared_last_nodes_from_other_lanelets(ll)
                 if x is None or y is None:
                     x, y = self.last_nodes.get(ll.lanelet_id, (None, None))
-                way_tl = Way(self.id_count, [x, y])
+                # The traffic-light ref_line is the stop line at the lanelet end:
+                # tag it type:stop_line (like _create_stop_line_to_way_dictionary).
+                # This also keeps _append_lane_change_tags from adding a spurious
+                # lane_change (stop_line is in its non_boundary skip set).
+                way_tl = Way(self.id_count, [x, y], tag_dict={"type": "stop_line"})
                 self.osm.add_way(way_tl)
                 way_list = [way_tl.id_]
                 # link each referenced traffic_light to its light_bulbs lamps (vm-04-03)
