@@ -1288,6 +1288,13 @@ class CR2LaneletConverter:
             if cw_rel_id is None:
                 continue
 
+            # Autoware's crosswalk regulatory_element_details validator (vm-05-01)
+            # requires the refers'd crosswalk lanelet to carry
+            # participant:pedestrian=yes; without it the reg-elem detail check is NG.
+            cw_way_rel = self.osm.find_way_rel_by_id(cw_rel_id)
+            if cw_way_rel is not None:
+                cw_way_rel.tag_dict["participant:pedestrian"] = "yes"
+
             # crosswalk_polygon footprint: left boundary, right boundary reversed,
             # then closed back to the first vertex.
             ring = list(lanelet.left_vertices) + list(lanelet.right_vertices[::-1])
