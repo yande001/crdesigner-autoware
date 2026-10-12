@@ -318,6 +318,8 @@ class Lanelet2CRConverter:
         self.transformer = Transformer.from_proj(crs_from, crs_to)
         self._left_way_ids: Optional[Dict[str, str]] = None
         self._right_way_ids: Optional[Dict[str, str]] = None
+        # (relation id, way id) -> True if the lanelet traverses the way in node order
+        self._way_forward: Optional[Dict[Tuple[str, str], bool]] = None
         self.first_left_pts: Optional[Dict[str, List[str]]] = None
         self.last_left_pts: Optional[Dict[str, List[str]]] = None
         self.first_right_pts: Optional[Dict[str, List[str]]] = None
@@ -346,6 +348,7 @@ class Lanelet2CRConverter:
 
         self.osm = osm
         self._left_way_ids, self._right_way_ids = defaultdict(list), defaultdict(list)
+        self._way_forward = {}
         self.first_left_pts, self.last_left_pts = defaultdict(list), defaultdict(list)
         self.first_right_pts, self.last_right_pts = defaultdict(list), defaultdict(list)
         if len(self.osm.nodes.values()) == 0:
@@ -876,6 +879,14 @@ class Lanelet2CRConverter:
             first_left_node, last_left_node = (last_left_node, first_left_node)
             first_right_node, last_right_node = (last_right_node, first_right_node)
 
+        # remember in which node order this lanelet traverses its boundary ways; needed to
+        # tell a true neighbour (shared way, consistent orientation) from an overlapping
+        # lanelet (same ways with swapped left/right roles, e.g. Autoware two-way lanes)
+        self._way_forward[(way_rel.id_, way_rel.left_way)] = first_left_node == left_way.nodes[0]
+        self._way_forward[(way_rel.id_, way_rel.right_way)] = (
+            first_right_node == right_way.nodes[0]
+        )
+
         # set first and last points
         self.first_left_pts[first_left_node].append(way_rel.id_)
         self.last_left_pts[last_left_node].append(way_rel.id_)
@@ -1195,7 +1206,7 @@ class Lanelet2CRConverter:
                     nb_lanelet.right_vertices[::-1],
                     self._config.adjacent_way_distance_tolerance,
                 ):
-                    self.lanelet_network.set_adjacent_right(lanelet, nb_lanelet.lanelet_id, True)
+                    self.lanelet_network.set_adjacent_right(lanelet, nb_lanelet.lanelet_id, False)
                     break
 
     def _check_right_and_left_neighbors(self, way_rel: WayRelation, lanelet: ConversionLanelet):
@@ -1207,25 +1218,81 @@ class Lanelet2CRConverter:
         :param way_rel: Relation from which lanelet was created.
         :param lanelet: Lanelet for which to check adjacencies.
         """
+
+        def _same_orientation(other_rel: str, way_id: str) -> Optional[bool]:
+            """True if both lanelets traverse ``way_id`` in the same node order."""
+            mine = self._way_forward.get((way_rel.id_, way_id))
+            theirs = self._way_forward.get((other_rel, way_id))
+            if mine is None or theirs is None:
+                return None
+            return mine == theirs
+
+        # Geometric reasoning for a shared way W (right-hand coordinates, lanelet body lies
+        # between its boundaries):
+        #   * our right == their left: true neighbour only if both run along W in the same
+        #     direction; if the other lanelet runs the opposite way its body lies on top of
+        #     ours (Autoware encodes two-way single lanes exactly like this) -> not adjacent.
+        #   * our left == their left (or right == right): neighbour in the opposite direction
+        #     only if the orientations differ; equal orientation again means overlap.
         potential_right_adj = self._left_way_ids.get(way_rel.right_way)
         potential_left_adj = self._right_way_ids.get(way_rel.left_way)
-        if potential_right_adj is not None:
-            self.lanelet_network.set_adjacent_right(lanelet, potential_right_adj, True)
+        if potential_right_adj is not None and potential_right_adj != way_rel.id_:
+            if _same_orientation(potential_right_adj, way_rel.right_way) is False:
+                logging.debug(
+                    "Lanelet2CRConverter: relation %s overlaps %s (shared way %s, opposite "
+                    "orientation); not adjacent",
+                    way_rel.id_,
+                    potential_right_adj,
+                    way_rel.right_way,
+                )
+                potential_right_adj = None
+            else:
+                self.lanelet_network.set_adjacent_right(lanelet, potential_right_adj, True)
 
-        if potential_left_adj is not None:
-            self.lanelet_network.set_adjacent_left(lanelet, potential_left_adj, True)
+        if potential_left_adj is not None and potential_left_adj != way_rel.id_:
+            if _same_orientation(potential_left_adj, way_rel.left_way) is False:
+                logging.debug(
+                    "Lanelet2CRConverter: relation %s overlaps %s (shared way %s, opposite "
+                    "orientation); not adjacent",
+                    way_rel.id_,
+                    potential_left_adj,
+                    way_rel.left_way,
+                )
+                potential_left_adj = None
+            else:
+                self.lanelet_network.set_adjacent_left(lanelet, potential_left_adj, True)
 
         # check if there are adjacent right and lefts which share a same way
         # and are in the opposite direction
         if not potential_left_adj:
             potential_left_adj = self._left_way_ids.get(way_rel.left_way)
-            if potential_left_adj is not None:
-                self.lanelet_network.set_adjacent_left(lanelet, potential_left_adj, False)
+            if potential_left_adj is not None and potential_left_adj != way_rel.id_:
+                if _same_orientation(potential_left_adj, way_rel.left_way) is True:
+                    logging.debug(
+                        "Lanelet2CRConverter: relation %s overlaps %s (same left way %s, same "
+                        "orientation); not adjacent",
+                        way_rel.id_,
+                        potential_left_adj,
+                        way_rel.left_way,
+                    )
+                else:
+                    self.lanelet_network.set_adjacent_left(lanelet, potential_left_adj, False)
 
         if not potential_right_adj:
             potential_right_adj = self._right_way_ids.get(way_rel.right_way)
-            if potential_right_adj is not None:
-                self.lanelet_network.set_adjacent_right(lanelet, potential_right_adj, False)
+            if potential_right_adj is not None and potential_right_adj != way_rel.id_:
+                if _same_orientation(potential_right_adj, way_rel.right_way) is True:
+                    logging.debug(
+                        "Lanelet2CRConverter: relation %s overlaps %s (same right way %s, same "
+                        "orientation); not adjacent",
+                        way_rel.id_,
+                        potential_right_adj,
+                        way_rel.right_way,
+                    )
+                else:
+                    self.lanelet_network.set_adjacent_right(
+                        lanelet, potential_right_adj, False
+                    )
 
     def _convert_way_to_vertices(self, way: Way) -> np.ndarray:
         """
@@ -1306,10 +1373,14 @@ class Lanelet2CRConverter:
             while self.osm.find_node_by_id(str(new_id)) is not None:
                 k = k + 1
                 new_id = int(start_node.id_) + k * 100 + i
-            # For Getting n additional nodes, we need to split the segment into n+1 smaller segments
-            new_lat = round(start_node_f[0] + (end_node_f[0] - start_node_f[0]) * i / (n + 1), 11)
-            new_lon = round(start_node_f[1] + (end_node_f[1] - start_node_f[1]) * i / (n + 1), 11)
-            new_ele = round(start_node_f[2] + (end_node_f[2] - start_node_f[2]) * i / (n + 1), 11)
+            # For Getting n additional nodes, we need to split the segment into n+1 smaller segments.
+            # Nodes are inserted at index `mid` from i = n down to 1, so the final order is
+            # nodes[mid-1], node_1, ..., node_n, nodes[mid]: node_i must sit at fraction i/(n+1)
+            # of the way from nodes[mid-1] (end_node) towards nodes[mid] (start_node).
+            # (Interpolating from start_node produced a zig-zag for n >= 2.)
+            new_lat = round(end_node_f[0] + (start_node_f[0] - end_node_f[0]) * i / (n + 1), 11)
+            new_lon = round(end_node_f[1] + (start_node_f[1] - end_node_f[1]) * i / (n + 1), 11)
+            new_ele = round(end_node_f[2] + (start_node_f[2] - end_node_f[2]) * i / (n + 1), 11)
             new_node = Node(new_id, new_lat, new_lon, new_ele)
             self.osm.add_node(new_node)
             shorter_way.nodes.insert(mid, new_node.id_)
