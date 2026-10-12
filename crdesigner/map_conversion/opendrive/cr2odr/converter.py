@@ -270,6 +270,14 @@ class Converter:
         # this function constructs all roads
         # using a breadth first search approach
         self.construct_roads([lanelet.lanelet_id])
+        # the BFS only reaches the connected component of the start lanelet;
+        # restart it from any lanelet that is still unvisited so disconnected
+        # parts of the network (common in hand-made Lanelet2 maps) are not dropped
+        while True:
+            unvisited = [l_id for l_id, visited in self.id_dict.items() if not visited]
+            if not unvisited:
+                break
+            self.construct_roads([unvisited[0]])
         # double check that no lanelet was missed
         self.check_all_visited()
 
@@ -301,6 +309,11 @@ class Converter:
         which makes it possible to convert multiple files queued up.
         """
         self.writer.save()
+        # keep a copy of the id bookkeeping so callers can export a lanelet -> road/lane
+        # mapping after the conversion (the class-level dicts are cleared below)
+        self.cr_id_to_od = dict(Road.cr_id_to_od)
+        self.lanelet_to_lane = dict(Road.lanelet_to_lane)
+        self.link_map = copy.deepcopy(Road.link_map)
         self.reset_converter()
 
     def reset_converter(self):
@@ -385,50 +398,51 @@ class Converter:
 
         :param frontier: used as a queue that contains to-be-explored nodes
         """
-        if not frontier:
-            return
+        # Iterative BFS (the former tail recursion used one Python frame per road and
+        # hit the recursion limit on networks with more than ~1000 roads).
+        while frontier:
+            # de-duplicate while keeping insertion order so the result is deterministic
+            frontier = list(dict.fromkeys(frontier))
+            l_id = frontier.pop(0)
+            if self.id_dict.get(l_id):
+                continue
+            lanelet = copy.deepcopy(self.lane_net.find_lanelet_by_id(l_id))
 
-        frontier = list(set(frontier))
-        l_id = frontier.pop(0)
-        lanelet = copy.deepcopy(self.lane_net.find_lanelet_by_id(l_id))
+            road_lanes = [lanelet]
 
-        road_lanes = [lanelet]
+            road_lanes = self.extend_road(lanelet, road_lanes, left=False, append=False)
+            road_lanes = self.extend_road(lanelet, road_lanes, left=True, append=True)
 
-        road_lanes = self.extend_road(lanelet, road_lanes, left=False, append=False)
-        road_lanes = self.extend_road(lanelet, road_lanes, left=True, append=True)
+            # remove adjacent lanes from frontier so that they are not visited anymore
+            self.add_ids(road_lanes, frontier)
 
-        # remove adjacent lanes from frontier so that they are not visited anymore
-        self.add_ids(road_lanes, frontier)
+            junction_id = -1
 
-        junction_id = -1
+            if lanelet.lanelet_id in self.inter_successors:
+                junction_id = self.lane_net.map_inc_lanelets_to_intersections[
+                    lanelet.predecessor[0]
+                ].intersection_id
 
-        if lanelet.lanelet_id in self.inter_successors:
-            junction_id = self.lane_net.map_inc_lanelets_to_intersections[
-                lanelet.predecessor[0]
-            ].intersection_id
+            road = Road(road_lanes, len(road_lanes), self.writer.root, junction_id)
 
-        road = Road(road_lanes, len(road_lanes), self.writer.root, junction_id)
+            for i in range(road.number_of_lanes):
+                if i <= road.center_number:
+                    for succ in road_lanes[i].successor:
+                        if not self.id_dict[succ]:
+                            frontier.append(succ)
 
-        for i in range(road.number_of_lanes):
-            if i <= road.center_number:
-                for succ in road_lanes[i].successor:
-                    if not self.id_dict[succ]:
-                        frontier.append(succ)
+                    for pred in road_lanes[i].predecessor:
+                        if not self.id_dict[pred]:
+                            frontier.append(pred)
 
-                for pred in road_lanes[i].predecessor:
-                    if not self.id_dict[pred]:
-                        frontier.append(pred)
+                else:
+                    for succ in road_lanes[i].predecessor:
+                        if not self.id_dict[succ]:
+                            frontier.append(succ)
 
-            else:
-                for succ in road_lanes[i].predecessor:
-                    if not self.id_dict[succ]:
-                        frontier.append(succ)
-
-                for pred in road_lanes[i].successor:
-                    if not self.id_dict[pred]:
-                        frontier.append(pred)
-
-        self.construct_roads(frontier)
+                    for pred in road_lanes[i].successor:
+                        if not self.id_dict[pred]:
+                            frontier.append(pred)
 
     def check_all_visited(self) -> None:
         """
@@ -436,7 +450,7 @@ class Converter:
         This is done to guarantee correctness of the road construction algorithm
         """
         for lanelet in self.lane_net.lanelets:
-            if self.id_dict.get(lanelet.lanelet_id) is None:
+            if not self.id_dict.get(lanelet.lanelet_id):
                 raise RuntimeError(
                     f"Lanelet {lanelet.lanelet_id} not visited! Check your algorithm."
                 )
@@ -551,9 +565,17 @@ class Converter:
         :param append: boolean
         :return: list of lanelet
         """
+        # ids already part of this road: inconsistent adjacency (e.g. two overlapping
+        # lanelets pointing at each other as "right neighbour") must not loop forever
+        road_ids = {lane.lanelet_id for lane in road_lanes}
+
         # extend to the right
         if not left and current.adj_right:
+            if current.adj_right in road_ids:
+                return road_lanes
             lane = self.lane_net.find_lanelet_by_id(current.adj_right)
+            if lane is None:
+                return road_lanes
 
             if append:
                 road_lanes.append(lane)
@@ -565,7 +587,11 @@ class Converter:
 
         # extend to the left
         elif left and current.adj_left:
+            if current.adj_left in road_ids:
+                return road_lanes
             lane = self.lane_net.find_lanelet_by_id(current.adj_left)
+            if lane is None:
+                return road_lanes
 
             if append:
                 road_lanes.append(lane)
