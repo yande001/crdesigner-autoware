@@ -75,6 +75,10 @@ GEOMETRY_HEADING_TAG = "hdg"
 GEOMETRY_CURV_START_TAG = "curvStart"
 GEOMETRY_CURV_END_TAG = "curvEnd"
 GEOMETRY_CURVATURE_TAG = "curvature"
+PARAM_POLY3_TAG = "paramPoly3"
+PARAM_POLY3_P_RANGE_TAG = "pRange"
+PARAM_POLY3_P_RANGE_NORMALIZED = "normalized"
+PARAM_POLY3_COEFFS = ("aU", "bU", "cU", "dU", "aV", "bV", "cV", "dV")
 
 # Signal param tags
 SIGNAL_T_TAG = "t"

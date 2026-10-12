@@ -48,6 +48,65 @@ def compute_heading(polyline_left: np.ndarray, polyline_right: np.ndarray) -> np
     return np.array(orientation)
 
 
+def _dedupe_polyline(polyline: np.ndarray, eps: float = 1e-6) -> np.ndarray:
+    """Drop consecutive duplicate vertices (zero-length segments break tangents)."""
+    keep = [0]
+    for i in range(1, len(polyline)):
+        if np.linalg.norm(polyline[i] - polyline[keep[-1]]) > eps:
+            keep.append(i)
+    return np.asarray(polyline)[keep]
+
+
+def compute_tangent_heading(polyline: np.ndarray) -> np.ndarray:
+    """
+    Heading of the polyline tangent at every vertex (central differences, one-sided at the
+    ends). Unlike compute_heading this does not depend on a second boundary.
+
+    :param polyline: Polyline with 2D points [[x_0, y_0], [x_1, y_1], ...]
+    :return: Orientations for each coordinate [rad]
+    """
+    pts = np.asarray(polyline, dtype=float)
+    if len(pts) < 2:
+        return np.zeros(len(pts))
+    tangents = np.empty_like(pts)
+    tangents[0] = pts[1] - pts[0]
+    tangents[-1] = pts[-1] - pts[-2]
+    if len(pts) > 2:
+        tangents[1:-1] = pts[2:] - pts[:-2]
+    return np.arctan2(tangents[:, 1], tangents[:, 0])
+
+
+def _hermite_param_poly3(p0, p1, hdg0, hdg1):
+    """
+    Cubic Hermite segment from p0 (tangent direction hdg0) to p1 (tangent direction hdg1)
+    expressed as OpenDRIVE paramPoly3 coefficients in the local frame of p0/hdg0 with a
+    normalized parameter, plus its arc length.
+
+    Tangent magnitudes are set to the chord length, the usual choice that keeps the
+    curve free of loops for the gentle per-segment turns of a resampled polyline.
+
+    :return: ((aU, bU, cU, dU), (aV, bV, cV, dV), length)
+    """
+    p0 = np.asarray(p0, dtype=float)
+    p1 = np.asarray(p1, dtype=float)
+    chord = float(np.linalg.norm(p1 - p0))
+    m0 = chord * np.array([np.cos(hdg0), np.sin(hdg0)])
+    m1 = chord * np.array([np.cos(hdg1), np.sin(hdg1)])
+    d = p1 - p0
+    # p(t) = p0 + m0 t + (3d - 2m0 - m1) t^2 + (-2d + m0 + m1) t^3
+    c2 = 3.0 * d - 2.0 * m0 - m1
+    c3 = -2.0 * d + m0 + m1
+    rot = np.array([[np.cos(-hdg0), -np.sin(-hdg0)], [np.sin(-hdg0), np.cos(-hdg0)]])
+    b = rot @ m0
+    c = rot @ c2
+    dd = rot @ c3
+    # arc length by fine sampling of the polynomial
+    t = np.linspace(0.0, 1.0, 33)
+    xy = np.outer(t, b) + np.outer(t**2, c) + np.outer(t**3, dd)
+    length = float(np.sum(np.linalg.norm(np.diff(xy, axis=0), axis=1)))
+    return (0.0, float(b[0]), float(c[0]), float(dd[0])), (0.0, float(b[1]), float(c[1]), float(dd[1])), length
+
+
 class Road:
     """
     This class adds road child element to OpenDRIVE root element
@@ -102,28 +161,34 @@ class Road:
 
         self.center_number = i
 
-        self.center = self.lane_list[i].left_vertices
-        self.hdg = compute_heading(self.center, self.lane_list[i].center_vertices)
-        self.center = (
-            np.insert(
-                self.center,
-                self.center.shape[0] - 1,
-                np.array(
-                    [
-                        self.center[-1][0] - np.cos(self.hdg[-1]) * 0.01,
-                        self.center[-1][1] - np.sin(self.hdg[-1]) * 0.01,
-                    ]
-                ),
-                0,
+        self.plan_view_mode = open_drive_config.cr2odr_plan_view
+        if self.plan_view_mode == "param_poly3":
+            # reference line = the raw boundary polyline; headings are its tangents
+            self.center = _dedupe_polyline(self.lane_list[i].left_vertices[:, :2])
+            self.hdg = compute_tangent_heading(self.center)
+        else:
+            self.center = self.lane_list[i].left_vertices
+            self.hdg = compute_heading(self.center, self.lane_list[i].center_vertices)
+            self.center = (
+                np.insert(
+                    self.center,
+                    self.center.shape[0] - 1,
+                    np.array(
+                        [
+                            self.center[-1][0] - np.cos(self.hdg[-1]) * 0.01,
+                            self.center[-1][1] - np.sin(self.hdg[-1]) * 0.01,
+                        ]
+                    ),
+                    0,
+                )
+                if self.hdg[-1] != 0.0
+                else self.center
             )
-            if self.hdg[-1] != 0.0
-            else self.center
-        )
-        self.hdg = (
-            np.insert(self.hdg, self.hdg.shape[0] - 1, self.hdg[-1])
-            if self.hdg[-1] != 0.0
-            else self.hdg
-        )
+            self.hdg = (
+                np.insert(self.hdg, self.hdg.shape[0] - 1, self.hdg[-1])
+                if self.hdg[-1] != 0.0
+                else self.hdg
+            )
 
         for i in range(0, number_of_lanes):
             Road.cr_id_to_od[lane_list[i].lanelet_id] = Road.counting
@@ -139,7 +204,11 @@ class Road:
 
         # planView - here goes all the geometry stuff
         self.plan_view = self.set_child_of_road(config.PLAN_VIEW_TAG)
-        length = self.set_plan_view()
+        if self.plan_view_mode == "param_poly3":
+            length = self.set_plan_view_param_poly3()
+        else:
+            length = self.set_plan_view()
+        self.length = length
 
         self.elevation_profile = self.set_child_of_road(config.ELEVATION_PROFILE_TAG)
         self.lateral_profile = self.set_child_of_road(config.LATERAL_PROFILE_TAG)
@@ -315,6 +384,49 @@ class Road:
             self.print_geometry(arc_length, cur_idx - 1, cur_type, curv, last_idx)
         return float(arc_length[-1])
 
+    def set_plan_view_param_poly3(self) -> float:
+        """
+        Plan view as one G1-continuous cubic (paramPoly3) per reference-line segment.
+        The road length is the sum of the cubic arc lengths, so <geometry s> and the
+        road <length> are consistent by construction.
+
+        :return: Length of the reference line
+        """
+        s = 0.0
+        for i in range(len(self.center) - 1):
+            u_coeffs, v_coeffs, length = _hermite_param_poly3(
+                self.center[i], self.center[i + 1], self.hdg[i], self.hdg[i + 1]
+            )
+            if length <= 0.0:
+                continue
+            self.print_param_poly3(
+                s,
+                float(self.center[i][0]),
+                float(self.center[i][1]),
+                float(self.hdg[i]),
+                length,
+                u_coeffs,
+                v_coeffs,
+            )
+            s += length
+        return s
+
+    def print_param_poly3(self, s, x, y, hdg, length, u_coeffs, v_coeffs) -> None:
+        """
+        Geometry child element with a paramPoly3 child (normalized parameter range).
+        """
+        geometry = etree.SubElement(self.plan_view, config.GEOMETRY_TAG)
+        geometry.set(config.GEOMETRY_S_COORDINATE_TAG, str.format(config.DOUBLE_FORMAT_PATTERN, s))
+        geometry.set(config.GEOMETRY_X_COORDINATE_TAG, str.format(config.DOUBLE_FORMAT_PATTERN, x))
+        geometry.set(config.GEOMETRY_Y_COORDINATE_TAG, str.format(config.DOUBLE_FORMAT_PATTERN, y))
+        geometry.set(config.GEOMETRY_HEADING_TAG, str.format(config.DOUBLE_FORMAT_PATTERN, hdg))
+        geometry.set(config.LENGTH_TAG, str.format(config.DOUBLE_FORMAT_PATTERN, length))
+
+        poly = etree.SubElement(geometry, config.PARAM_POLY3_TAG)
+        for name, value in zip(config.PARAM_POLY3_COEFFS, (*u_coeffs, *v_coeffs)):
+            poly.set(name, str.format(config.DOUBLE_FORMAT_PATTERN, value))
+        poly.set(config.PARAM_POLY3_P_RANGE_TAG, config.PARAM_POLY3_P_RANGE_NORMALIZED)
+
     def print_geometry(
         self,
         path_length: np.array,
@@ -325,6 +437,15 @@ class Road:
     ):
         this_length = path_length[end_idx] - path_length[start_idx]
         if geo_type == GeometryType.LINE:
+            self.print_line(
+                path_length[start_idx],
+                float(self.center[start_idx][0]),
+                float(self.center[start_idx][1]),
+                float(self.hdg[start_idx]),
+                this_length,
+            )
+        elif geo_type == GeometryType.ARC and abs(curv[end_idx]) < 1e-9:
+            # an arc with curvature 0 is a line; readers divide by the curvature
             self.print_line(
                 path_length[start_idx],
                 float(self.center[start_idx][0]),
@@ -536,7 +657,17 @@ class Road:
                 )
             )
 
-            dist_list = compute_polyline_lengths(cur.center_vertices)
+            if open_drive_config.cr2odr_piecewise_width:
+                if cur is self.lane_list[self.center_number] and len(cur.left_vertices) == len(self.center):
+                    # OpenDRIVE widths are measured along the road normal; pairing the two
+                    # boundaries by sample index measures obliquely on tight curves
+                    width_list = self._normal_widths(cur.right_vertices)
+                # s of every sample measured on the *reference line*, not along the lane's
+                # own centre (which is longer/shorter on curves and runs backwards for
+                # opposite-direction lanes)
+                width_list, dist_list = self._project_widths_on_reference(cur, width_list)
+            else:
+                dist_list = compute_polyline_lengths(cur.center_vertices)
             lane_id = i - self.center_number
 
             # lanelets to the right should get a negative id
@@ -554,6 +685,70 @@ class Road:
                 )
                 Road.lanelet_to_lane[self.lane_list[i].lanelet_id] = lane_id
                 self.inner_links[self.lane_list[i].lanelet_id] = lane_id
+
+    def _normal_widths(self, other: np.ndarray) -> List[float]:
+        """
+        Distance from every reference-line vertex to polyline ``other`` along the local
+        normal (ray cast both ways, nearest hit); falls back to the nearest-point distance
+        where the ray misses.
+        """
+        ref = np.asarray(self.center, dtype=float)[:, :2]
+        other = np.asarray(other, dtype=float)[:, :2]
+        seg = np.diff(other, axis=0)
+        seg_len2 = np.maximum(np.einsum("ij,ij->i", seg, seg), 1e-12)
+        widths = []
+        for k, p in enumerate(ref):
+            normal = np.array([-np.sin(self.hdg[k]), np.cos(self.hdg[k])])
+            # solve p + u*normal = a + v*seg  for each segment
+            denom = normal[0] * (-seg[:, 1]) - normal[1] * (-seg[:, 0])
+            rel = other[:-1] - p
+            with np.errstate(divide="ignore", invalid="ignore"):
+                u = (rel[:, 0] * (-seg[:, 1]) - rel[:, 1] * (-seg[:, 0])) / denom
+                v = (normal[0] * rel[:, 1] - normal[1] * rel[:, 0]) / denom
+            hit = np.isfinite(u) & (v >= -1e-9) & (v <= 1 + 1e-9)
+            if np.any(hit):
+                widths.append(float(np.min(np.abs(u[hit]))))
+            else:
+                t = np.clip(np.einsum("ij,ij->i", -rel, seg) / seg_len2, 0.0, 1.0)
+                proj = other[:-1] + seg * t[:, None]
+                widths.append(float(np.min(np.hypot(*(p - proj).T))))
+        return widths
+
+    def _project_widths_on_reference(self, lane: Lanelet, width_list: List[float]):
+        """
+        Pair each lane width sample with the reference-line s of its centre vertex.
+        Returns (widths, s_values) sorted by s, clipped to [0, road length], starting at 0.
+        """
+        ref = np.asarray(self.center, dtype=float)[:, :2]
+        seg = np.diff(ref, axis=0)
+        seg_len = np.hypot(seg[:, 0], seg[:, 1])
+        cum = np.concatenate([[0.0], np.cumsum(seg_len)])
+        scale = self.length / cum[-1] if cum[-1] > 0 else 1.0  # polyline vs. cubic length
+        s_vals = []
+        ref_lane = self.lane_list[self.center_number]
+        if lane is ref_lane and len(ref_lane.left_vertices) == len(width_list) == len(ref):
+            # the reference line *is* this lane's left boundary: sample k sits at s_k exactly
+            # (nearest-point projection is ambiguous on tight curves such as U-turns)
+            s_vals = [float(c * scale) for c in cum]
+        else:
+            for pt in np.asarray(lane.center_vertices, dtype=float)[:, :2]:
+                rel = pt - ref[:-1]
+                t = np.clip(np.einsum("ij,ij->i", rel, seg) / np.maximum(seg_len**2, 1e-12), 0.0, 1.0)
+                proj = ref[:-1] + seg * t[:, None]
+                k = int(np.argmin(np.hypot(*(pt - proj).T)))
+                s_vals.append(float((cum[k] + t[k] * seg_len[k]) * scale))
+        pairs = sorted(zip(s_vals, width_list))
+        # strictly increasing s, inside the road
+        out_s, out_w = [], []
+        for s_val, w in pairs:
+            s_val = min(max(s_val, 0.0), self.length)
+            if out_s and s_val <= out_s[-1] + 1e-6:
+                continue
+            out_s.append(s_val)
+            out_w.append(float(w))
+        if out_s:
+            out_s[0] = 0.0
+        return out_w, np.asarray(out_s)
 
     # nice idea to reuse the subelement generation for left center and right
     # produces something like:
@@ -601,12 +796,25 @@ class Road:
         # just do it the good ol' way
         if len(width_list) > 1:
             # just trying another method:
-            width_list = [width_list[0], width_list[-1]]
             x = [dist_list[0], dist_list[-1]]
 
-            b, a = np.polyfit(x, width_list, 1)
+            b, a = np.polyfit(x, [width_list[0], width_list[-1]], 1)
 
-        if lane_id != 0:
+        if lane_id != 0 and open_drive_config.cr2odr_piecewise_width and len(width_list) > 1:
+            # one linear piece per sample pair: follows width changes along the lane
+            # (dist_list is the lane's own centre-line arc length, used as s offset)
+            for k in range(len(width_list) - 1):
+                ds = float(dist_list[k + 1] - dist_list[k])
+                if ds <= 0.0:
+                    continue
+                slope = (width_list[k + 1] - width_list[k]) / ds
+                width = etree.SubElement(lane_pos, config.SIGNAL_WIDTH_TAG)
+                width.set(config.LANE_SOFFSET_TAG, str.format(config.DOUBLE_FORMAT_PATTERN, dist_list[k]))
+                width.set(config.LANE_A_TAG, str.format(config.DOUBLE_FORMAT_PATTERN, width_list[k]))
+                width.set(config.LANE_B_TAG, str.format(config.DOUBLE_FORMAT_PATTERN, slope))
+                width.set(config.LANE_C_TAG, str.format(config.DOUBLE_FORMAT_PATTERN, 0))
+                width.set(config.LANE_D_TAG, str.format(config.DOUBLE_FORMAT_PATTERN, 0))
+        elif lane_id != 0:
             # this should maybe not be hardcoded
             width = etree.SubElement(lane_pos, config.SIGNAL_WIDTH_TAG)
             width.set(config.LANE_SOFFSET_TAG, str.format(config.DOUBLE_FORMAT_PATTERN, 0))

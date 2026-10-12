@@ -116,6 +116,26 @@ class OpenDriveConfig(BaseConfig):
         50, "Curvature threshold clothoid", "Constant for lane parameters evaluation"
     )
 
+    # Reference-line representation written by cr2odr:
+    #   "primitives": classify the polyline into line/arc/spiral pieces (upstream behaviour)
+    #   "param_poly3": one cubic (paramPoly3, normalized p) per polyline segment, G1-continuous,
+    #                  passes exactly through every vertex and keeps s/length bookkeeping exact
+    cr2odr_plan_view = Attribute(
+        "primitives",
+        "Plan view mode",
+        "Reference line geometry written by cr2odr: 'primitives' (line/arc/spiral) or "
+        "'param_poly3' (cubic per polyline segment)",
+        options=["primitives", "param_poly3"],
+    )
+
+    # Lane width records written by cr2odr: a single linear fit between the first and last
+    # sample (upstream) or one linear piece per sample pair
+    cr2odr_piecewise_width = Attribute(
+        False,
+        "Piecewise lane width",
+        "Write one <width> record per sample pair instead of a single linear fit",
+    )
+
     LAYOUT = [
         [
             "Conversion Parameters odr2cr",
@@ -143,6 +163,8 @@ class OpenDriveConfig(BaseConfig):
             curvature_threshold,
             curvature_dif_threshold,
             lane_evaluation_step,
+            cr2odr_plan_view,
+            cr2odr_piecewise_width,
         ],
     ]
 
