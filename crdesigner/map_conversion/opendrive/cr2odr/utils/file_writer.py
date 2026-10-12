@@ -61,7 +61,10 @@ class Writer:
         self.header.set(config.WEST, str.format(config.DOUBLE_FORMAT_PATTERN, val))
         if geo_reference != "":
             self.geo_reference = etree.SubElement(self.header, config.GEO_REFFERENCE_TAG)
-            self.geo_reference.text = f"<![CDATA[{geo_reference}]]>"
+            # Use a real CDATA node: assigning the literal "<![CDATA[...]]>" string makes
+            # lxml escape the angle brackets, so the file ends up with "&lt;![CDATA[" and
+            # consumers (pyproj, CARLA) fail to parse the projection string.
+            self.geo_reference.text = etree.CDATA(geo_reference)
 
     def set_child_of_road(self, name: str) -> etree:
         """
