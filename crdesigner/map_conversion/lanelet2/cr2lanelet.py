@@ -970,6 +970,10 @@ class CR2LaneletConverter:
                     odr_section_id = int(parts[1])
                     odr_lane_id = int(parts[2])
                     self.odr_to_l2_mapping[(odr_road_id, odr_section_id, odr_lane_id)] = way_rel.id_
+                    # Also carry the identity on the relation itself so it survives
+                    # post-processing (dedup, split) that mints/deletes relation ids;
+                    # the ID-mapping CSV is built from the final tree via this tag.
+                    way_rel.tag_dict["odr_lane"] = f"{odr_road_id}.{odr_section_id}.{odr_lane_id}"
                 except ValueError:
                     pass
 
